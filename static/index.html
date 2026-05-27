@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ForkCast AI – Restaurant Intelligence</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- Sidebar -->
+  <nav class="sidebar">
+    <div class="logo">
+      <span class="logo-icon">🍴</span>
+      <span class="logo-text">ForkCast AI</span>
+    </div>
+    <ul class="nav-links">
+      <li class="nav-item active" data-tab="dashboard">
+        <span class="nav-icon">📊</span> Dashboard
+      </li>
+      <li class="nav-item" data-tab="predictions">
+        <span class="nav-icon">🔮</span> Predictions
+      </li>
+      <li class="nav-item" data-tab="inventory">
+        <span class="nav-icon">📦</span> Inventory
+      </li>
+      <li class="nav-item" data-tab="history">
+        <span class="nav-icon">📈</span> Performance
+      </li>
+      <li class="nav-item" data-tab="settings">
+        <span class="nav-icon">⚙️</span> Settings
+      </li>
+    </ul>
+    <div class="sidebar-footer">
+      <div id="train-status" class="status-badge">⏳ Loading…</div>
+    </div>
+  </nav>
+
+  <!-- Main content -->
+  <main class="main">
+
+    <!-- Header -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1 id="page-title">Dashboard</h1>
+        <span id="page-subtitle" class="subtitle"></span>
+      </div>
+      <div class="topbar-right">
+        <span class="date-badge" id="pred-date-label"></span>
+        <button class="btn btn-primary" onclick="App.retrain()">↺ Retrain Models</button>
+      </div>
+    </header>
+
+    <!-- Tab: Dashboard -->
+    <section id="tab-dashboard" class="tab-content active">
+      <div class="metrics-row" id="summary-cards"></div>
+
+      <div class="charts-row">
+        <div class="card chart-card wide">
+          <div class="card-header">
+            <h3>Tomorrow's Predicted Sales by Item</h3>
+          </div>
+          <canvas id="chart-predictions" height="100"></canvas>
+        </div>
+        <div class="card chart-card">
+          <div class="card-header">
+            <h3>Sales by Category</h3>
+          </div>
+          <canvas id="chart-category" height="100"></canvas>
+        </div>
+      </div>
+
+      <div class="charts-row">
+        <div class="card chart-card" style="flex:1">
+          <div class="card-header">
+            <h3>Revenue Trend (Last 90 Days)</h3>
+          </div>
+          <canvas id="chart-trend" height="80"></canvas>
+        </div>
+      </div>
+
+      <!-- 7-day weather strip -->
+      <div class="card">
+        <div class="card-header">
+          <h3>🌤️ 7-Day Weather Forecast <span id="weather-location" class="subtitle"></span></h3>
+          <div class="card-actions">
+            <span id="weather-source" class="source-tag"></span>
+            <button class="btn btn-sm btn-secondary" onclick="App.refreshWeather()">↺ Refresh</button>
+          </div>
+        </div>
+        <div id="weather-strip" class="weather-strip"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>🚨 Inventory Alerts</h3>
+        </div>
+        <div id="alerts-list"></div>
+      </div>
+    </section>
+
+    <!-- Tab: Predictions -->
+    <section id="tab-predictions" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <h3>Sales Predictions – Next Day</h3>
+          <div class="card-actions">
+            <input type="date" id="pred-date-input" class="date-input"/>
+            <button class="btn btn-sm btn-primary" onclick="App.loadPredictions()">Fetch</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="predictions-table" class="data-table">
+            <thead>
+              <tr>
+                <th>Item</th>
+                <th>Category</th>
+                <th>Predicted Qty</th>
+                <th>80% CI Low</th>
+                <th>80% CI High</th>
+                <th>Price</th>
+                <th>Exp. Revenue</th>
+                <th>Promotion</th>
+                <th>Model MAE</th>
+                <th>Override</th>
+              </tr>
+            </thead>
+            <tbody id="predictions-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><h3>Prediction Ranges (Error Bars)</h3></div>
+        <canvas id="chart-ci" height="80"></canvas>
+      </div>
+    </section>
+
+    <!-- Tab: Inventory -->
+    <section id="tab-inventory" class="tab-content">
+      <div class="metrics-row" id="inventory-cards"></div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>Ingredient Purchase Recommendations</h3>
+          <div class="card-actions">
+            <button class="btn btn-sm btn-secondary" onclick="App.exportInventoryCSV()">⬇ Export CSV</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="inventory-table">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Ingredient</th>
+                <th>Unit</th>
+                <th>Current Stock</th>
+                <th>Gross Required</th>
+                <th>Safety Buffer</th>
+                <th>Total Required</th>
+                <th>To Order</th>
+                <th>Order Units</th>
+                <th>Est. Cost</th>
+                <th>Shelf Life</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="inventory-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab: History -->
+    <section id="tab-history" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <h3>Model Performance Metrics</h3>
+          <div class="card-actions">
+            <label>Days back: <input type="number" id="perf-days" value="30" min="7" max="180" style="width:70px" class="date-input"/></label>
+            <button class="btn btn-sm btn-primary" onclick="App.loadPerformance()">Load</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="perf-table">
+            <thead>
+              <tr>
+                <th>Item</th>
+                <th>MAE</th>
+                <th>RMSE</th>
+                <th>Days Evaluated</th>
+                <th>Accuracy Grade</th>
+              </tr>
+            </thead>
+            <tbody id="perf-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="charts-row">
+        <div class="card chart-card wide">
+          <div class="card-header"><h3>Actual vs Predicted – Top Items</h3></div>
+          <canvas id="chart-avp" height="90"></canvas>
+        </div>
+        <div class="card chart-card">
+          <div class="card-header"><h3>Error Distribution</h3></div>
+          <canvas id="chart-errors" height="90"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab: Settings -->
+    <section id="tab-settings" class="tab-content">
+      <div class="settings-grid">
+
+        <div class="card">
+          <div class="card-header"><h3>Update Stock Levels</h3></div>
+          <p class="hint">Enter current quantities on hand before generating recommendations.</p>
+          <div class="table-wrap">
+            <table class="data-table" id="stock-table">
+              <thead>
+                <tr><th>Ingredient</th><th>Unit</th><th>Current Stock</th><th>New Value</th><th>Save</th></tr>
+              </thead>
+              <tbody id="stock-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3>📍 Restaurant Location</h3></div>
+          <p class="hint">Used for automatic weather forecasts via Open-Meteo (free, no API key).</p>
+          <div class="form-group">
+            <label>Restaurant Name</label>
+            <input type="text" id="cfg-name" class="form-input" style="width:100%"/>
+          </div>
+          <div class="form-row">
+            <div class="form-group" style="flex:1">
+              <label>Latitude</label>
+              <input type="number" id="cfg-lat" step="0.0001" class="form-input" style="width:100%"/>
+            </div>
+            <div class="form-group" style="flex:1">
+              <label>Longitude</label>
+              <input type="number" id="cfg-lon" step="0.0001" class="form-input" style="width:100%"/>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Timezone</label>
+            <input type="text" id="cfg-tz" placeholder="e.g. America/New_York" class="form-input" style="width:100%"/>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center">
+            <button class="btn btn-primary" onclick="App.saveConfig()">Save &amp; Fetch Weather</button>
+            <button class="btn btn-secondary" onclick="App.refreshWeather()">↺ Refresh Forecast Now</button>
+          </div>
+          <div id="config-msg" class="msg"></div>
+          <div id="config-weather-preview" style="margin-top:14px"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3>✏️ Manual Weather Override</h3></div>
+          <p class="hint">Override a single day's forecast (e.g. if a local event changes conditions).</p>
+          <div class="form-group">
+            <label>Date</label>
+            <input type="date" id="w-date" class="form-input"/>
+          </div>
+          <div class="form-group">
+            <label>Temperature (°C)</label>
+            <input type="number" id="w-temp" value="18" class="form-input"/>
+          </div>
+          <div class="form-group">
+            <label>Precipitation (mm)</label>
+            <input type="number" id="w-precip" value="0" step="0.1" class="form-input"/>
+          </div>
+          <div class="form-group">
+            <label>Condition</label>
+            <select id="w-condition" class="form-input">
+              <option>sunny</option>
+              <option>cloudy</option>
+              <option>rainy</option>
+              <option>snowy</option>
+              <option>stormy</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" onclick="App.saveWeather()">Save Override</button>
+          <div id="weather-msg" class="msg"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3>Active Promotions</h3></div>
+          <div id="promos-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3>Upcoming Holidays</h3></div>
+          <div id="holidays-list"></div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Stock update modal -->
+<div id="stock-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Update Stock: <span id="modal-ing-name"></span></h3>
+    <input type="number" id="modal-qty" class="form-input" step="0.1" min="0"/>
+    <div class="modal-actions">
+      <button class="btn btn-primary" onclick="App.confirmStockUpdate()">Save</button>
+      <button class="btn btn-secondary" onclick="App.closeModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+restaurant.db
+models/
+config.json
+.env
+venv/
