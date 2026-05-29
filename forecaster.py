@@ -1,24 +1,23 @@
 """
-Per-item sales forecaster using pure numpy (bootstrap ridge regression).
-No scikit-learn dependency — fast to install and deploy.
+Per-item sales forecaster — pure Python, no numpy, no scikit-learn.
+Uses ridge regression with Gaussian elimination + residual-based confidence intervals.
 """
 from __future__ import annotations
 import os
 import json
 import math
-import numpy as np
+import random
+import pickle
 from datetime import date, timedelta
 from collections import defaultdict
 from sqlalchemy.orm import Session
 from database import Sale, WeatherData, Holiday, Promotion, MenuItem
-import joblib
 
 MODEL_DIR = "models"
 METRICS_PATH = os.path.join(MODEL_DIR, "metrics.json")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-N_BOOTSTRAP = 100   # bootstrap samples for confidence intervals
-ALPHA = 10.0        # ridge regularisation strength
+ALPHA = 10.0   # ridge regularisation
 
 
 def _model_path(item_id: int) -> str:
@@ -29,6 +28,80 @@ def _date_range(start: date, end: date) -> list[date]:
     return [start + timedelta(days=i) for i in range((end - start).days + 1)]
 
 
+# ── Pure-Python linear algebra ────────────────────────────────────────────────
+
+def _dot(a: list, b: list) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _mat_xtx(X: list[list]) -> list[list]:
+    p = len(X[0])
+    result = [[0.0] * p for _ in range(p)]
+    for row in X:
+        for i in range(p):
+            for j in range(p):
+                result[i][j] += row[i] * row[j]
+    return result
+
+
+def _mat_xty(X: list[list], y: list) -> list:
+    p = len(X[0])
+    result = [0.0] * p
+    for row, yi in zip(X, y):
+        for i in range(p):
+            result[i] += row[i] * yi
+    return result
+
+
+def _solve(A: list[list], b: list) -> list:
+    """Gaussian elimination with partial pivoting."""
+    n = len(b)
+    M = [[A[i][j] for j in range(n)] + [float(b[i])] for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(M[r][col]))
+        M[col], M[pivot] = M[pivot], M[col]
+        if abs(M[col][col]) < 1e-12:
+            continue
+        for row in range(col + 1, n):
+            f = M[row][col] / M[col][col]
+            for j in range(col, n + 1):
+                M[row][j] -= f * M[col][j]
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        x[i] = M[i][n] - sum(M[i][j] * x[j] for j in range(i + 1, n))
+        if abs(M[i][i]) > 1e-12:
+            x[i] /= M[i][i]
+    return x
+
+
+# ── Ridge regression model ────────────────────────────────────────────────────
+
+class RidgeModel:
+    def __init__(self, alpha: float = ALPHA):
+        self.alpha = alpha
+        self.params: list[float] = []
+        self.residual_std: float = 1.0
+
+    def fit(self, X: list[list], y: list) -> "RidgeModel":
+        n, p = len(X), len(X[0])
+        Xb = [[1.0] + row for row in X]
+        pb = p + 1
+        XtX = _mat_xtx(Xb)
+        for i in range(1, pb):
+            XtX[i][i] += self.alpha
+        Xty = _mat_xty(Xb, y)
+        self.params = _solve(XtX, Xty)
+        preds = [max(0.0, _dot(self.params, row)) for row in Xb]
+        residuals = [yi - pi for yi, pi in zip(y, preds)]
+        mean_r = sum(residuals) / len(residuals) if residuals else 0.0
+        var_r = sum((r - mean_r) ** 2 for r in residuals) / len(residuals) if residuals else 1.0
+        self.residual_std = max(0.5, math.sqrt(var_r))
+        return self
+
+    def predict(self, x: list) -> float:
+        return max(0.0, _dot(self.params, [1.0] + x))
+
+
 # ── Feature engineering ───────────────────────────────────────────────────────
 
 def _build_feature_row(
@@ -37,82 +110,37 @@ def _build_feature_row(
     has_promotion: bool, promo_discount: float,
     lag_7: float, lag_14: float, lag_21: float,
     roll_mean_7: float, roll_mean_14: float, roll_std_7: float,
-) -> dict:
+) -> list:
     dow = dt.weekday()
-    return {
-        "day_of_week":    dow,
-        "is_weekend":     int(dow >= 5),
-        "month":          dt.month,
-        "day_of_month":   dt.day,
-        "week_of_year":   dt.isocalendar()[1],
-        "sin_dow":        math.sin(2 * math.pi * dow / 7),
-        "cos_dow":        math.cos(2 * math.pi * dow / 7),
-        "sin_month":      math.sin(2 * math.pi * dt.month / 12),
-        "cos_month":      math.cos(2 * math.pi * dt.month / 12),
-        "temperature":    temperature,
-        "precipitation":  precipitation,
-        "is_raining":     int(precipitation > 1),
-        "is_holiday":     int(is_holiday),
-        "holiday_factor": holiday_factor,
-        "has_promotion":  int(has_promotion),
-        "promo_discount": promo_discount,
-        "lag_7":          lag_7,
-        "lag_14":         lag_14,
-        "lag_21":         lag_21,
-        "roll_mean_7":    roll_mean_7,
-        "roll_mean_14":   roll_mean_14,
-        "roll_std_7":     roll_std_7,
-    }
+    return [
+        dow,
+        int(dow >= 5),
+        dt.month,
+        dt.day,
+        dt.isocalendar()[1],
+        math.sin(2 * math.pi * dow / 7),
+        math.cos(2 * math.pi * dow / 7),
+        math.sin(2 * math.pi * dt.month / 12),
+        math.cos(2 * math.pi * dt.month / 12),
+        temperature,
+        precipitation,
+        int(precipitation > 1),
+        int(is_holiday),
+        holiday_factor,
+        int(has_promotion),
+        promo_discount,
+        lag_7, lag_14, lag_21,
+        roll_mean_7, roll_mean_14, roll_std_7,
+    ]
 
 
-FEATURE_COLS = list(_build_feature_row(
-    date.today(), 20, 0, False, 1.0, False, 0.0, 10, 10, 10, 10, 10, 1.0
-).keys())
-
-
-# ── Ridge regression (pure numpy) ─────────────────────────────────────────────
-
-class RidgeModel:
-    def __init__(self, alpha: float = ALPHA):
-        self.alpha = alpha
-        self.params: np.ndarray | None = None
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "RidgeModel":
-        n, p = X.shape
-        Xb = np.column_stack([np.ones(n), X])
-        A = Xb.T @ Xb + self.alpha * np.eye(p + 1)
-        A[0, 0] -= self.alpha          # don't regularise bias
-        self.params = np.linalg.solve(A, Xb.T @ y)
-        return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        Xb = np.column_stack([np.ones(len(X)), X])
-        return np.maximum(0.0, Xb @ self.params)
-
-
-class BootstrapForecaster:
-    """Ensemble of ridge models on bootstrap samples for uncertainty."""
-
-    def __init__(self, n_estimators: int = N_BOOTSTRAP):
-        self.n_estimators = n_estimators
-        self.estimators: list[RidgeModel] = []
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "BootstrapForecaster":
-        rng = np.random.default_rng(42)
-        n = len(X)
-        self.estimators = []
-        for _ in range(self.n_estimators):
-            idx = rng.integers(0, n, size=n)
-            m = RidgeModel().fit(X[idx], y[idx])
-            self.estimators.append(m)
-        return self
-
-    def predict_with_std(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        preds = np.stack([m.predict(X) for m in self.estimators])
-        return preds.mean(axis=0), preds.std(axis=0)
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        return self.predict_with_std(X)[0]
+FEATURE_COLS = [
+    "day_of_week", "is_weekend", "month", "day_of_month", "week_of_year",
+    "sin_dow", "cos_dow", "sin_month", "cos_month",
+    "temperature", "precipitation", "is_raining",
+    "is_holiday", "holiday_factor", "has_promotion", "promo_discount",
+    "lag_7", "lag_14", "lag_21", "roll_mean_7", "roll_mean_14", "roll_std_7",
+]
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -166,18 +194,29 @@ def _default_weather(dt: date) -> dict:
     return {"temperature": round(temp, 1), "precipitation": 0.0}
 
 
-def _item_series(item_id: int, sales_dict: dict, date_list: list[date]) -> np.ndarray:
+def _item_series(item_id: int, sales_dict: dict, date_list: list[date]) -> list[float]:
     item_data = sales_dict.get(item_id, {})
-    return np.array([float(item_data.get(d, 0.0)) for d in date_list], dtype=float)
+    return [float(item_data.get(d, 0.0)) for d in date_list]
+
+
+def _list_mean(vals: list) -> float:
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _list_std(vals: list) -> float:
+    if len(vals) < 2:
+        return 1.0
+    m = _list_mean(vals)
+    return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
 
 
 def _build_item_dataset(
     item_id: int, sales_dict: dict, date_list: list[date],
     weather_map: dict, holiday_map: dict, promo_map: dict,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[list[list], list]:
     series = _item_series(item_id, sales_dict, date_list)
-    if np.sum(series) == 0:
-        return np.empty((0, len(FEATURE_COLS))), np.array([])
+    if sum(series) == 0:
+        return [], []
 
     X_rows, y_vals = [], []
     for i, dt in enumerate(date_list):
@@ -186,31 +225,29 @@ def _build_item_dataset(
         lag_7, lag_14, lag_21 = series[i-7], series[i-14], series[i-21]
         last7  = series[max(0, i-7):i]
         last14 = series[max(0, i-14):i]
-        roll_mean_7  = float(np.mean(last7))  if len(last7)  else float(lag_7)
-        roll_mean_14 = float(np.mean(last14)) if len(last14) else float(lag_7)
-        roll_std_7   = float(np.std(last7))   if len(last7) > 1 else 1.0
+        roll_mean_7  = _list_mean(last7)  if last7  else lag_7
+        roll_mean_14 = _list_mean(last14) if last14 else lag_7
+        roll_std_7   = _list_std(last7)
         w = weather_map.get(dt, _default_weather(dt))
-        h_factor = holiday_map.get(dt, 1.0)
+        has_promo, disc = _is_promoted(item_id, dt, promo_map)
         row = _build_feature_row(
             dt, w["temperature"], w["precipitation"],
-            dt in holiday_map, h_factor,
-            *_is_promoted(item_id, dt, promo_map),
-            float(lag_7), float(lag_14), float(lag_21),
+            dt in holiday_map, holiday_map.get(dt, 1.0),
+            has_promo, disc,
+            lag_7, lag_14, lag_21,
             roll_mean_7, roll_mean_14, roll_std_7,
         )
-        X_rows.append(list(row.values()))
+        X_rows.append(row)
         y_vals.append(series[i])
 
-    if not X_rows:
-        return np.empty((0, len(FEATURE_COLS))), np.array([])
-    return np.array(X_rows, dtype=float), np.array(y_vals, dtype=float)
+    return X_rows, y_vals
 
 
 # ── Forecaster class ──────────────────────────────────────────────────────────
 
 class SalesForecaster:
     def __init__(self):
-        self.models: dict[int, BootstrapForecaster] = {}
+        self.models: dict[int, RidgeModel] = {}
         self.item_ids: list[int] = []
         self.training_metrics: dict[int, dict] = {}
         self.is_trained = False
@@ -234,14 +271,16 @@ class SalesForecaster:
             X_tr, X_te = X[:split], X[split:]
             y_tr, y_te = y[:split], y[split:]
 
-            model = BootstrapForecaster().fit(X_tr, y_tr)
+            model = RidgeModel().fit(X_tr, y_tr)
 
-            if len(X_te) > 0:
-                y_pred = model.predict(X_te)
-                mae  = float(np.mean(np.abs(y_te - y_pred)))
-                rmse = float(np.sqrt(np.mean((y_te - y_pred) ** 2)))
-                nz = y_te > 0
-                mape = float(np.mean(np.abs((y_te[nz] - y_pred[nz]) / y_te[nz])) * 100) if nz.sum() > 0 else 0.0
+            if X_te:
+                y_pred = [model.predict(x) for x in X_te]
+                errors = [abs(a - p) for a, p in zip(y_te, y_pred)]
+                sq_errors = [(a - p) ** 2 for a, p in zip(y_te, y_pred)]
+                mae  = sum(errors) / len(errors)
+                rmse = math.sqrt(sum(sq_errors) / len(sq_errors))
+                nz = [(a, p) for a, p in zip(y_te, y_pred) if a > 0]
+                mape = sum(abs(a - p) / a for a, p in nz) / len(nz) * 100 if nz else 0.0
             else:
                 mae = rmse = mape = 0.0
 
@@ -249,7 +288,8 @@ class SalesForecaster:
             self.training_metrics[item_id] = {
                 "mae": round(mae, 2), "rmse": round(rmse, 2), "mape": round(mape, 1)
             }
-            joblib.dump(model, _model_path(item_id))
+            with open(_model_path(item_id), "wb") as f:
+                pickle.dump(model, f)
 
         self.is_trained = True
         with open(METRICS_PATH, "w") as fh:
@@ -263,7 +303,8 @@ class SalesForecaster:
         for item_id in item_ids:
             p = _model_path(item_id)
             if os.path.exists(p):
-                self.models[item_id] = joblib.load(p)
+                with open(p, "rb") as f:
+                    self.models[item_id] = pickle.load(f)
                 loaded += 1
         if loaded == len(item_ids) and loaded > 0:
             self.is_trained = True
@@ -292,19 +333,19 @@ class SalesForecaster:
             item_id = item.id
             if item_id not in self.models:
                 continue
-            series = _item_series(item_id, sales_dict, date_list) if date_list else np.array([])
+            series = _item_series(item_id, sales_dict, date_list) if date_list else []
             n = len(series)
 
             def _lag(k):
                 idx = n - k
-                return float(series[idx]) if idx >= 0 and n > 0 else (float(np.mean(series)) if n > 0 else 0.0)
+                return float(series[idx]) if 0 <= idx < n else (_list_mean(series) if series else 0.0)
 
             lag_7, lag_14, lag_21 = _lag(7), _lag(14), _lag(21)
-            last7  = series[max(0, n-7):]  if n > 0 else np.array([])
-            last14 = series[max(0, n-14):] if n > 0 else np.array([])
-            roll_mean_7  = float(np.mean(last7))  if len(last7)  else lag_7
-            roll_mean_14 = float(np.mean(last14)) if len(last14) else lag_7
-            roll_std_7   = float(np.std(last7))   if len(last7) > 1 else 1.0
+            last7  = series[max(0, n-7):]  if n > 0 else []
+            last14 = series[max(0, n-14):] if n > 0 else []
+            roll_mean_7  = _list_mean(last7)  if last7  else lag_7
+            roll_mean_14 = _list_mean(last14) if last14 else lag_7
+            roll_std_7   = _list_std(last7)
 
             has_promo, disc = _is_promoted(item_id, target_date, promo_map)
             feat = _build_feature_row(
@@ -312,10 +353,10 @@ class SalesForecaster:
                 is_hol, h_factor, has_promo, disc,
                 lag_7, lag_14, lag_21, roll_mean_7, roll_mean_14, roll_std_7,
             )
-            X_np = np.array([list(feat.values())], dtype=float)
+            model = self.models[item_id]
+            mean_pred = model.predict(feat)
+            std_pred  = model.residual_std
 
-            mean_pred, std_pred = self.models[item_id].predict_with_std(X_np)
-            mean_pred, std_pred = float(mean_pred[0]), float(std_pred[0])
             lower = max(0.0, mean_pred - 1.645 * std_pred)
             upper = mean_pred + 1.645 * std_pred
             metrics = self.training_metrics.get(item_id, {})
@@ -355,23 +396,21 @@ class SalesForecaster:
             for i, dt in enumerate(date_list):
                 if dt < start_eval or i < 21:
                     continue
-                lag_7, lag_14, lag_21 = float(series[i-7]), float(series[i-14]), float(series[i-21])
+                lag_7, lag_14, lag_21 = series[i-7], series[i-14], series[i-21]
                 last7  = series[max(0, i-7):i]
                 last14 = series[max(0, i-14):i]
-                roll_mean_7  = float(np.mean(last7))  if len(last7)  else lag_7
-                roll_mean_14 = float(np.mean(last14)) if len(last14) else lag_7
-                roll_std_7   = float(np.std(last7))   if len(last7) > 1 else 1.0
+                roll_mean_7  = _list_mean(last7)  if last7  else lag_7
+                roll_mean_14 = _list_mean(last14) if last14 else lag_7
+                roll_std_7   = _list_std(last7)
                 w = weather_map.get(dt, _default_weather(dt))
-                h_factor = holiday_map.get(dt, 1.0)
                 feat = _build_feature_row(
                     dt, w["temperature"], w["precipitation"],
-                    dt in holiday_map, h_factor,
+                    dt in holiday_map, holiday_map.get(dt, 1.0),
                     *_is_promoted(item_id, dt, promo_map),
                     lag_7, lag_14, lag_21, roll_mean_7, roll_mean_14, roll_std_7,
                 )
-                X_np = np.array([list(feat.values())], dtype=float)
-                pred   = float(model.predict(X_np)[0])
-                actual = float(series[i])
+                pred   = model.predict(feat)
+                actual = series[i]
                 rows.append({
                     "date":      dt.isoformat(),
                     "item_id":   item_id,
