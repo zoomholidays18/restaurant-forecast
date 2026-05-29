@@ -11,7 +11,6 @@ import warnings
 import joblib
 import numpy as np
 warnings.filterwarnings("ignore", category=UserWarning)
-import pandas as pd
 from datetime import date, timedelta
 from collections import defaultdict
 from sklearn.ensemble import RandomForestRegressor
@@ -26,6 +25,11 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 def _model_path(item_id: int) -> str:
     return os.path.join(MODEL_DIR, f"item_{item_id}.pkl")
+
+
+def _date_range(start: date, end: date) -> list[date]:
+    n = (end - start).days + 1
+    return [start + timedelta(days=i) for i in range(n)]
 
 
 # ── Feature engineering ───────────────────────────────────────────────────────
@@ -79,18 +83,23 @@ FEATURE_COLS = list(_build_feature_row(
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def _load_sales_df(db: Session) -> pd.DataFrame:
-    rows = (
-        db.query(Sale.sale_date, Sale.menu_item_id, Sale.quantity_sold)
-        .all()
-    )
-    df = pd.DataFrame(rows, columns=["date", "item_id", "qty"])
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+def _load_sales_data(db: Session):
+    """Returns (sales_dict, min_date, max_date).
+    sales_dict: {item_id: {date: qty}}
+    """
+    rows = db.query(Sale.sale_date, Sale.menu_item_id, Sale.quantity_sold).all()
+    sales_dict: dict[int, dict[date, float]] = defaultdict(lambda: defaultdict(float))
+    all_dates: list[date] = []
+    for sale_date, item_id, qty in rows:
+        d = sale_date if isinstance(sale_date, date) else sale_date
+        sales_dict[item_id][d] += float(qty)
+        all_dates.append(d)
+    if not all_dates:
+        return sales_dict, None, None
+    return sales_dict, min(all_dates), max(all_dates)
 
 
 def _load_context_maps(db: Session):
-    """Returns (weather_map, holiday_map, promo_map)."""
     weather_map: dict[date, dict] = {}
     for w in db.query(WeatherData).all():
         weather_map[w.weather_date] = {
@@ -124,53 +133,46 @@ def _is_promoted(item_id: int, dt: date, promo_map: dict) -> tuple[bool, float]:
 
 
 def _default_weather(dt: date) -> dict:
-    """Seasonal temperature estimate when no weather record exists."""
     doy = dt.timetuple().tm_yday
     temp = 10 + 10 * math.sin(2 * math.pi * (doy - 80) / 365)
     return {"temperature": round(temp, 1), "precipitation": 0.0}
+
+
+def _item_series(item_id: int, sales_dict: dict, date_list: list[date]) -> np.ndarray:
+    item_data = sales_dict.get(item_id, {})
+    return np.array([float(item_data.get(d, 0.0)) for d in date_list], dtype=float)
 
 
 # ── Build training dataset for one item ───────────────────────────────────────
 
 def _build_item_dataset(
     item_id: int,
-    sales_df: pd.DataFrame,
+    sales_dict: dict,
+    date_list: list[date],
     weather_map: dict,
     holiday_map: dict,
     promo_map: dict,
-) -> tuple[pd.DataFrame, pd.Series]:
+) -> tuple[np.ndarray, np.ndarray]:
 
-    item_df = (
-        sales_df[sales_df["item_id"] == item_id]
-        .groupby("date")["qty"].sum()
-        .rename("qty")
-    )
+    series = _item_series(item_id, sales_dict, date_list)
 
-    if item_df.empty:
-        return pd.DataFrame(), pd.Series(dtype=float)
+    if np.sum(series) == 0:
+        return np.empty((0, len(FEATURE_COLS))), np.array([])
 
-    min_date = sales_df["date"].min().date()
-    max_date = sales_df["date"].max().date()
-    all_dates = pd.date_range(min_date, max_date, freq="D")
-    item_series = item_df.reindex(all_dates, fill_value=0)
-
-    rows, targets = [], []
-    for i, (idx, qty) in enumerate(item_series.items()):
-        dt: date = idx.date()
-
-        if i < 21:  # need at least 21 days of lag
+    X_rows, y_vals = [], []
+    for i, dt in enumerate(date_list):
+        if i < 21:
             continue
 
-        past = item_series.iloc[max(0, i - 21): i].values
-        lag_7  = float(item_series.iloc[i - 7])  if i >= 7  else float(past.mean())
-        lag_14 = float(item_series.iloc[i - 14]) if i >= 14 else float(past.mean())
-        lag_21 = float(item_series.iloc[i - 21]) if i >= 21 else float(past.mean())
+        lag_7  = series[i - 7]
+        lag_14 = series[i - 14]
+        lag_21 = series[i - 21]
 
-        last7  = item_series.iloc[max(0, i - 7): i].values
-        last14 = item_series.iloc[max(0, i - 14): i].values
-        roll_mean_7  = float(last7.mean())  if len(last7)  else lag_7
-        roll_mean_14 = float(last14.mean()) if len(last14) else lag_7
-        roll_std_7   = float(last7.std())   if len(last7) > 1 else 1.0
+        last7  = series[max(0, i - 7): i]
+        last14 = series[max(0, i - 14): i]
+        roll_mean_7  = float(np.mean(last7))  if len(last7) else float(lag_7)
+        roll_mean_14 = float(np.mean(last14)) if len(last14) else float(lag_7)
+        roll_std_7   = float(np.std(last7))   if len(last7) > 1 else 1.0
 
         w = weather_map.get(dt, _default_weather(dt))
         h_factor = holiday_map.get(dt, 1.0)
@@ -180,15 +182,16 @@ def _build_item_dataset(
         row = _build_feature_row(
             dt, w["temperature"], w["precipitation"],
             is_hol, h_factor, has_promo, disc,
-            lag_7, lag_14, lag_21,
+            float(lag_7), float(lag_14), float(lag_21),
             roll_mean_7, roll_mean_14, roll_std_7,
         )
-        rows.append(row)
-        targets.append(float(qty))
+        X_rows.append(list(row.values()))
+        y_vals.append(series[i])
 
-    X = pd.DataFrame(rows, columns=FEATURE_COLS)
-    y = pd.Series(targets)
-    return X, y
+    if not X_rows:
+        return np.empty((0, len(FEATURE_COLS))), np.array([])
+
+    return np.array(X_rows, dtype=float), np.array(y_vals, dtype=float)
 
 
 # ── Forecaster class ──────────────────────────────────────────────────────────
@@ -204,21 +207,25 @@ class SalesForecaster:
 
     def train(self, db: Session) -> None:
         print("Training sales forecasting models …")
-        sales_df = _load_sales_df(db)
+        sales_dict, min_date, max_date = _load_sales_data(db)
+        if min_date is None:
+            print("No sales data found.")
+            return
+
+        date_list = _date_range(min_date, max_date)
         weather_map, holiday_map, promo_map = _load_context_maps(db)
 
         item_ids = [r.id for r in db.query(MenuItem.id).filter(MenuItem.is_active == True).all()]
         self.item_ids = item_ids
 
         for item_id in item_ids:
-            X, y = _build_item_dataset(item_id, sales_df, weather_map, holiday_map, promo_map)
-            if X.empty or len(X) < 30:
+            X, y = _build_item_dataset(item_id, sales_dict, date_list, weather_map, holiday_map, promo_map)
+            if len(X) < 30:
                 continue
 
-            # Train/test split: last 30 days for evaluation
             split = max(30, int(len(X) * 0.85))
-            X_train, X_test = X.iloc[:split], X.iloc[split:]
-            y_train, y_test = y.iloc[:split], y.iloc[split:]
+            X_train, X_test = X[:split], X[split:]
+            y_train, y_test = y[:split], y[split:]
 
             model = RandomForestRegressor(
                 n_estimators=200,
@@ -233,10 +240,9 @@ class SalesForecaster:
                 y_pred = model.predict(X_test)
                 mae  = mean_absolute_error(y_test, y_pred)
                 rmse = math.sqrt(mean_squared_error(y_test, y_pred))
-                # Filter zero-actual rows to avoid divide-by-zero in MAPE
-                nonzero = y_test.values > 0
+                nonzero = y_test > 0
                 if nonzero.sum() > 0:
-                    mape = float(np.mean(np.abs((y_test.values[nonzero] - y_pred[nonzero]) / y_test.values[nonzero])) * 100)
+                    mape = float(np.mean(np.abs((y_test[nonzero] - y_pred[nonzero]) / y_test[nonzero])) * 100)
                 else:
                     mape = 0.0
             else:
@@ -275,15 +281,14 @@ class SalesForecaster:
     def predict_next_day(
         self, db: Session, target_date: date | None = None
     ) -> list[dict]:
-        if target_date is None:
-            sales_df = _load_sales_df(db)
-            last_date = sales_df["date"].max().date()
-            target_date = last_date + timedelta(days=1)
+        sales_dict, min_date, max_date = _load_sales_data(db)
 
-        sales_df = _load_sales_df(db)
+        if target_date is None:
+            target_date = (max_date + timedelta(days=1)) if max_date else (date.today() + timedelta(days=1))
+
+        date_list = _date_range(min_date, target_date - timedelta(days=1)) if min_date else []
         weather_map, holiday_map, promo_map = _load_context_maps(db)
 
-        # Weather for target date: use DB record or seasonal estimate
         w = weather_map.get(target_date, _default_weather(target_date))
         h_factor = holiday_map.get(target_date, 1.0)
         is_hol = target_date in holiday_map
@@ -296,28 +301,19 @@ class SalesForecaster:
             if item_id not in self.models:
                 continue
 
-            # Compute lag features from historical sales
-            item_df = (
-                sales_df[sales_df["item_id"] == item_id]
-                .groupby("date")["qty"].sum()
-            )
-            item_dates = pd.date_range(
-                sales_df["date"].min(), target_date - timedelta(days=1), freq="D"
-            )
-            item_series = item_df.reindex(item_dates, fill_value=0)
+            series = _item_series(item_id, sales_dict, date_list) if date_list else np.array([])
+            n = len(series)
 
-            n = len(item_series)
-
-            def _lag(k):
-                idx = n - k
-                return float(item_series.iloc[idx]) if idx >= 0 else float(item_series.mean())
+            def _lag(k, _n=n, _s=series):
+                idx = _n - k
+                return float(_s[idx]) if idx >= 0 and _n > 0 else (float(np.mean(_s)) if _n > 0 else 0.0)
 
             lag_7, lag_14, lag_21 = _lag(7), _lag(14), _lag(21)
-            last7  = item_series.iloc[max(0, n - 7):].values
-            last14 = item_series.iloc[max(0, n - 14):].values
-            roll_mean_7  = float(last7.mean())  if len(last7) else lag_7
-            roll_mean_14 = float(last14.mean()) if len(last14) else lag_7
-            roll_std_7   = float(last7.std())   if len(last7) > 1 else 1.0
+            last7  = series[max(0, n - 7):]  if n > 0 else np.array([])
+            last14 = series[max(0, n - 14):] if n > 0 else np.array([])
+            roll_mean_7  = float(np.mean(last7))  if len(last7) else lag_7
+            roll_mean_14 = float(np.mean(last14)) if len(last14) else lag_7
+            roll_std_7   = float(np.std(last7))   if len(last7) > 1 else 1.0
 
             has_promo, disc = _is_promoted(item_id, target_date, promo_map)
 
@@ -327,16 +323,14 @@ class SalesForecaster:
                 lag_7, lag_14, lag_21,
                 roll_mean_7, roll_mean_14, roll_std_7,
             )
-            X = pd.DataFrame([feature_row], columns=FEATURE_COLS)
+            X_np = np.array([list(feature_row.values())], dtype=float)
 
             model = self.models[item_id]
-            X_np = X.values  # avoid sklearn feature-name warning per tree
-            # Ensemble predictions from each tree for confidence interval
             tree_preds = np.array([t.predict(X_np)[0] for t in model.estimators_])
             mean_pred  = float(np.mean(tree_preds))
             std_pred   = float(np.std(tree_preds))
 
-            lower = max(0.0, mean_pred - 1.645 * std_pred)   # 90 % CI
+            lower = max(0.0, mean_pred - 1.645 * std_pred)
             upper = mean_pred + 1.645 * std_pred
 
             metrics = self.training_metrics.get(item_id, {})
@@ -359,16 +353,15 @@ class SalesForecaster:
 
         return results
 
-    # ── Historical evaluation (actual vs predicted) ───────────────────────────
+    # ── Historical evaluation ─────────────────────────────────────────────────
 
     def historical_accuracy(self, db: Session, last_n_days: int = 30) -> list[dict]:
-        sales_df = _load_sales_df(db)
-        if sales_df.empty:
+        sales_dict, min_date, max_date = _load_sales_data(db)
+        if min_date is None:
             return []
 
-        max_date = sales_df["date"].max().date()
         start_eval = max_date - timedelta(days=last_n_days)
-
+        date_list = _date_range(min_date, max_date)
         weather_map, holiday_map, promo_map = _load_context_maps(db)
         items = {i.id: i for i in db.query(MenuItem).filter(MenuItem.is_active == True).all()}
 
@@ -378,31 +371,20 @@ class SalesForecaster:
             if not item:
                 continue
 
-            item_df = (
-                sales_df[sales_df["item_id"] == item_id]
-                .groupby("date")["qty"].sum()
-            )
-            all_dates = pd.date_range(sales_df["date"].min(), max_date, freq="D")
-            item_series = item_df.reindex(all_dates, fill_value=0)
+            series = _item_series(item_id, sales_dict, date_list)
 
-            eval_dates = pd.date_range(start_eval, max_date, freq="D")
-
-            for dt_stamp in eval_dates:
-                dt = dt_stamp.date()
-                i = (dt_stamp - all_dates[0]).days
-                if i < 21:
+            for i, dt in enumerate(date_list):
+                if dt < start_eval or i < 21:
                     continue
 
-                def _lag(k):
-                    idx = i - k
-                    return float(item_series.iloc[idx]) if idx >= 0 else float(item_series.mean())
-
-                lag_7, lag_14, lag_21 = _lag(7), _lag(14), _lag(21)
-                last7  = item_series.iloc[max(0, i - 7): i].values
-                last14 = item_series.iloc[max(0, i - 14): i].values
-                roll_mean_7  = float(last7.mean())  if len(last7) else lag_7
-                roll_mean_14 = float(last14.mean()) if len(last14) else lag_7
-                roll_std_7   = float(last7.std())   if len(last7) > 1 else 1.0
+                lag_7  = float(series[i - 7])
+                lag_14 = float(series[i - 14])
+                lag_21 = float(series[i - 21])
+                last7  = series[max(0, i - 7): i]
+                last14 = series[max(0, i - 14): i]
+                roll_mean_7  = float(np.mean(last7))  if len(last7) else lag_7
+                roll_mean_14 = float(np.mean(last14)) if len(last14) else lag_7
+                roll_std_7   = float(np.std(last7))   if len(last7) > 1 else 1.0
 
                 w = weather_map.get(dt, _default_weather(dt))
                 h_factor = holiday_map.get(dt, 1.0)
@@ -415,9 +397,9 @@ class SalesForecaster:
                     lag_7, lag_14, lag_21,
                     roll_mean_7, roll_mean_14, roll_std_7,
                 )
-                X = pd.DataFrame([feat], columns=FEATURE_COLS)
-                pred = float(model.predict(X)[0])
-                actual = float(item_series.iloc[i])
+                X_np = np.array([list(feat.values())], dtype=float)
+                pred   = float(model.predict(X_np)[0])
+                actual = float(series[i])
 
                 rows.append({
                     "date":      dt.isoformat(),
